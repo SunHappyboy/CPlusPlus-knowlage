@@ -263,6 +263,345 @@ connect(sender, &Sender::testSignal,
 | 支持跨线程通信 | 信号不能是模板函数 |
 | 一对多连接 | 槽函数返回值难以获取 |
 
+---
+
+#### 信号槽底层实现原理
+
+**完整调用流程**
+
+```
+emit signal(args)
+    ↓
+MOC 生成的信号函数 void ClassName::signal(args)
+    ↓
+QMetaObject::activate(sender, signal_index, args)
+    ↓
+获取 QObjectPrivate::ConnectionVector
+    ↓
+遍历该信号的所有 Connection
+    ↓
+根据 Qt::ConnectionType 分发：
+    ├─ DirectConnection:    直接调用槽函数（同栈）
+    ├─ QueuedConnection:    创建 QMetaCallEvent，postEvent
+    ├─ BlockingQueued:      postEvent + QSemaphore::wait()
+    └─ AutoConnection:      判断线程，选 Direct 或 Queued
+    ↓
+槽函数执行 (通过 qt_metacall 或直接调用)
+```
+
+**QObjectPrivate 连接存储结构**
+
+```cpp
+// qobject_p.h - Qt 内部连接存储机制
+namespace QObjectPrivate {
+
+// ========== 单个连接结构 ==========
+class Connection {
+public:
+    QObject *receiver;           // 接收者对象指针
+    QObject *sender;             // 发送者对象指针（Qt5.15+）
+
+    // 槽函数指针（多种形式）
+    union {
+        void (**slot)(void **);      // 函数指针数组
+        int method_offset;           // 方法在元对象表中的偏移
+        QStaticSlotResultFunc func;  // 静态函数
+    };
+
+    Connection *next;            // 链表下一个节点
+    Connection *prev;            // 链表前一个节点（Qt5 优化）
+
+    // 连接属性（位域节省空间）
+    ushort connectionType : 3;   // Qt::ConnectionType (0-4)
+    ushort isSlotObject : 1;     // 是否是槽对象对象
+    ushort ownArgumentTypes : 1;  // 是否拥有参数类型
+    ushort argumentTypes : 12;   // 参数类型数量
+
+    int *argumentTypes;          // 参数类型数组（用于类型检查）
+};
+
+// ========== 连接链表（每个信号一个）==========
+class ConnectionList {
+public:
+    Connection *first;           // 链表头节点
+    Connection *last;            // 链表尾节点（优化追加操作）
+
+    // 并发控制
+    QAtomicInt inUse;           // 使用计数（防止重入问题）
+    QAtomicInt orphaned;        // 孤儿连接计数
+};
+
+// ========== 连接向量（所有信号的集合）==========
+class ConnectionVector {
+public:
+    ConnectionList *vector;      // ConnectionList 数组
+    int count;                   // 信号数量
+
+    // 动态扩容
+    void grow(int signalCount);
+};
+
+} // namespace QObjectPrivate
+
+// ========== QObject::d_ptr 包含连接数据 ==========
+class QObjectPrivate : public QObjectPrivateData {
+public:
+    ConnectionVector connectionLists;  // 所有信号-槽连接
+    // ... 其他私有数据
+};
+```
+
+**MOC 生成的信号函数源码**
+
+```cpp
+// moc_myclass.cpp - MOC 自动生成的信号实现
+
+// 1. 信号函数实现（emit signal() 展开后就是这个）
+void MyClass::dataChanged(int _t1)
+{
+    // _t1 是参数，void** _a 是参数数组
+    void *_a[] = {
+        nullptr,  // [0] 返回值位置（信号无返回值）
+        const_cast<void*>(reinterpret_cast<const void*>(&_t1))  // [1] 参数1
+    };
+
+    // 调用 QMetaObject::activate 激活信号
+    QMetaObject::activate(
+        this,                           // sender
+        &staticMetaObject,             // 元对象
+        staticMetaObject.methodOffset(0),  // 信号索引
+        _a                             // 参数数组
+    );
+}
+
+// 2. 无参数信号
+void MyClass::progressUpdated()
+{
+    void *_a[] = { nullptr };
+    QMetaObject::activate(this, &staticMetaObject,
+                          staticMetaObject.methodOffset(1), _a);
+}
+```
+
+**QMetaObject::activate 核心实现（简化）**
+
+```cpp
+// qmetaobject.cpp - 信号激活核心函数
+void QMetaObject::activate(QObject *sender,
+                           const QMetaObject *m,
+                           int local_signal_index,
+                           void **argv)
+{
+    int signal_index = m->methodOffset() + local_signal_index;
+
+    // ========== 1. 获取连接列表 ==========
+    QObjectPrivate *senderPriv = QObjectPrivate::get(sender);
+    QObjectPrivate::ConnectionVector *connectionVector =
+        &senderPriv->connectionLists;
+
+    // 检查是否有该信号的连接
+    if (signal_index >= connectionVector->count)
+        return;
+
+    QObjectPrivate::ConnectionList *list =
+        &connectionVector->vector[signal_index];
+
+    // ========== 2. 遍历所有连接 ==========
+    QObjectPrivate::Connection *c = list->first;
+
+    // 标记使用中（防止重入时连接被删除）
+    while (c) {
+        QObjectPrivate::Connection *next = c->next;
+        QObject *receiver = c->receiver;
+
+        if (!receiver) {
+            c = next;
+            continue;  // 接收者已被删除，跳过
+        }
+
+        // ========== 3. 根据连接类型分发 ==========
+        switch (c->connectionType) {
+            case Qt::AutoConnection:
+                // 自动判断：同线程直接调用，跨线程队列
+                if (QThread::currentThread() == receiver->thread()) {
+                    // 同线程：直接调用
+                    QObjectPrivate::activate receiver, c, argv);
+                } else {
+                    // 跨线程：投递事件
+                    QCoreApplication::postEvent(
+                        receiver,
+                        new QMetaCallEvent(c, argv)
+                    );
+                }
+                break;
+
+            case Qt::DirectConnection:
+                // 强制直接调用（可能跨线程，危险）
+                QObjectPrivate::activate receiver, c, argv);
+                break;
+
+            case Qt::QueuedConnection:
+                // 强制队列调用
+                QCoreApplication::postEvent(
+                    receiver,
+                    new QMetaCallEvent(c, sender, signal_index, argv)
+                );
+                break;
+
+            case Qt::BlockingQueuedConnection:
+                // 阻塞队列：必须跨线程
+                QSemaphore semaphore;
+                QCoreApplication::postEvent(
+                    receiver,
+                    new QMetaCallEvent(c, sender, signal_index, argv, &semaphore)
+                );
+                semaphore.acquire();  // 等待槽函数执行完成
+                break;
+
+            case Qt::UniqueConnection:
+                // 不是真正的连接类型，用于 connect 时检查重复
+                break;
+        }
+
+        c = next;
+    }
+}
+
+// ========== 槽函数调用（内部函数）==========
+namespace QObjectPrivate {
+    void activate receiver,
+                       Connection *c,
+                       void **argv)
+    {
+        // 方式1：通过方法偏移调用（moc 生成的槽）
+        if (c->method_offset) {
+            QMetaObject::metacall(
+                receiver,
+                QMetaObject::InvokeMetaMethod,
+                c->method_offset - 1,
+                argv
+            );
+        }
+        // 方式2：直接函数指针调用（functor 或 lambda）
+        else if (c->slot) {
+            c->slot(argv);
+        }
+    }
+}
+```
+
+**跨线程信号槽原理**
+
+```cpp
+// ========== QMetaCallEvent - 跨线程调用的事件 ==========
+
+class QMetaCallEvent : public QEvent {
+public:
+    QMetaCallEvent(Connection *c, QObject *sender,
+                   int signalId, void **argv,
+                   QSemaphore *semaphore = nullptr)
+        : QEvent(MetaCall), connection(c), sender(sender),
+          signalId(signalId), semaphore(semaphore)
+    {
+        // 拷贝参数（因为跨线程，原参数可能失效）
+        // ... 参数序列化
+    }
+
+    // 事件被接收者线程处理时调用
+    void placeMetaCall(QObject *receiver) {
+        // 调用槽函数
+        QObjectPrivate::activate receiver, connection, args);
+
+        // 如果是 BlockingQueued，释放信号量
+        if (semaphore)
+            semaphore->release();
+    }
+
+private:
+    Connection *connection;
+    QObject *sender;
+    int signalId;
+    QSemaphore *semaphore;
+    // ... 参数存储
+};
+
+// ========== 跨线程调用流程 ==========
+/*
+ * 线程 A (sender)              线程 B (receiver)
+ *     |
+ *     | emit signal()
+ *     |
+ *     v
+ * QMetaObject::activate()
+ *     |
+ *     | 检测到跨线程
+ *     |
+ *     v
+ * QCoreApplication::postEvent() --------> 事件队列
+ *                                         |
+ *                                         | QMetaCallEvent
+ *                                         |
+ *                                         v
+ *                                    QEventLoop::exec()
+ *                                         |
+ *                                         | 处理事件
+ *                                         |
+ *                                         v
+ *                                    receiver->event()
+ *                                         |
+ *                                         | QEvent::MetaCall
+ *                                         |
+ *                                         v
+ *                                    QMetaCallEvent::placeMetaCall()
+ *                                         |
+ *                                         | 调用槽函数
+ *                                         |
+ *                                         v
+ *                                    qt_metacall()
+ *                                         |
+ *                                         v
+ *                                    实际槽函数执行
+ */
+```
+
+**connect 函数底层流程（Qt5 指针语法）**
+
+```cpp
+// qobject.cpp - Qt5 connect 实现简化
+QMetaObject::Connection QObject::connect(
+    const QObject *sender,
+    const void **signal_ptr,      // &Sender::valueChanged 的地址
+    const QObject *receiver,
+    const void **method_ptr,      // &Receiver::updateValue 的地址
+    Qt::ConnectionType type)
+{
+    // ========== 1. 从指针中提取信号索引 ==========
+    // signal_ptr 指向成员函数指针，需要解析出信号在元对象表中的索引
+    int signal_index = QMetaObject::connectImpl(
+        sender, signal_ptr, receiver, method_ptr, type);
+
+    if (signal_index < 0)
+        return QMetaObject::Connection();
+
+    // ========== 2. 创建 Connection 结构 ==========
+    QObjectPrivate::Connection *c = new QObjectPrivate::Connection;
+    c->sender = const_cast<QObject*>(sender);
+    c->receiver = const_cast<QObject*>(receiver);
+    c->connectionType = type;
+    c->method_offset = 0;  // 对于函数指针形式
+    c->slot = /* 解析 method_ptr 得到函数指针 */;
+
+    // ========== 3. 添加到连接链表 ==========
+    QObjectPrivate::get(sender)->addConnection(signal_index, c);
+
+    return QMetaObject::Connection(c);  // 返回连接句柄
+}
+
+// ========== 信号索引查找（通过函数指针）==========
+// Qt 使用函数指针地址的唯一性来定位信号
+// 这是 Qt5 新语法能实现编译时检查的关键
+```
+
 ### 2.2 元对象系统
 
 ```cpp
@@ -358,6 +697,363 @@ qDebug() << "Enum string:" << enumStr;  // "Value2"
 // - 元对象数据
 // - 信号实现
 // - qt_metacall 实现
+```
+
+---
+
+#### 元对象系统底层实现
+
+**QMetaObject 结构详解**
+
+```cpp
+// qmetaobject.h - 元对象核心结构
+struct QMetaObject {
+    // ========== 元数据表（字符串和索引）==========
+    const char *stringdata;      // 字符串数据池
+    const uint *data;            // 索引数据（4字节对齐的整数数组）
+
+    // ========== 类继承链 ==========
+    const QMetaObject *superdata; // 父类元对象（链表结构）
+
+    // ========== 扩展数据 ==========
+    const QMetaObjectPrivate *d;  // 私有数据（Qt5）
+
+    // ========== 静态元对象（每个类只有一个）==========
+    static const QMetaObject staticMetaObject;
+
+    // ========== 核心接口 ==========
+    int methodOffset() const;     // 信号起始索引
+    int propertyOffset() const;   // 属性起始索引
+    int classInfoOffset() const;  // 类信息起始索引
+
+    int methodCount() const;      // 方法总数（信号+槽+其他）
+    int propertyCount() const;
+    int enumeratorCount() const;
+
+    // 查找接口
+    int indexOfMethod(const char *method) const;
+    int indexOfProperty(const char *name) const;
+    int indexOfEnumerator(const char *name) const;
+};
+
+// ========== 元数据布局（data 数组）==========
+/*
+ * data 数组是 4 字节整数数组，每个位置含义不同：
+ *
+ * [0]  revision (14)          // 版本号
+ * [1]  className             // 类名在 stringdata 中的索引
+ * [2]  classInfoCount        // 类信息数量
+ * [3]  classInfoOffset       // 类信息起始索引
+ * [4]  methodCount           // 方法数量
+ * [5]  methodOffset          // 方法起始索引
+ * [6]  propertyCount         // 属性数量
+ * [7]  propertyOffset        // 属性起始索引
+ * [8]  enumeratorCount       // 枚举数量
+ * [9]  enumeratorOffset      // 枚举起始索引
+ * [10] constructorCount      // 构造函数数量
+ * [11] constructorOffset     // 构造函数起始索引
+ * [12] flags                 // 类标志 (0x01 =_requires_constructor)
+ * [13] signalCount           // 信号数量
+ *
+ * // 方法数据区（从 methodOffset 开始）
+ * [N+0] name                 // 方法名在 stringdata 中的索引
+ * [N+1] signature            // 方法签名（含参数）在 stringdata 中索引
+ * [N+2] type                 // 参数类型（在 stringdata 中索引），逗号分隔
+ * [N+3] tag                  // 标签
+ * [N+4] flags                // 标志位
+ *
+ * // flags 位域含义：
+ * // 0x01: AccessPrivate     0x02: AccessProtected
+ * // 0x04: AccessPublic      0x08: MethodMethod
+ * // 0x10: MethodSignal      0x20: MethodSlot
+ * // 0x40: MethodConstructor 0x80: MethodType
+ */
+```
+
+**MOC 生成的完整源码（moc_myclass.cpp）**
+
+```cpp
+/****************************************************************************
+** Meta object code from reading C++ file 'myclass.h'
+**
+** Created by: The Qt Meta Object Compiler version 5.15.x
+**
+** WARNING! All changes made in this file will be lost!
+*****************************************************************************/
+
+#include <memory>
+#include "myclass.h"
+#include <QtCore/qmetatype.h>
+#include <QtCore/qstring.h>
+
+// ========== 1. 字符串数据池 ==========
+static const uint qt_meta_data_MyClass[] = {
+    // content:
+    14,       // revision
+    0,        // classname
+    0,    0,  // classinfo
+    3,   14,  // methods (3 个方法)
+    1,   29,  // properties (1 个属性)
+    0,    0,  // enums/sets
+    0,    0,  // constructors
+    4,       // flags (RequiresConstructor)
+
+    // 字符串索引
+    0x0,     // methods: name (valueChanged)
+    0x1,     // methods: signature
+    0x13,    // methods: parameter types (int)
+    0x17,    // methods: tag
+    0x10,    // methods: flags (AccessPublic, MethodSignal)
+
+    0x18,    // methods: name (onDataChanged)
+    0x27,    // methods: signature
+    0x3A,    // methods: parameter types
+    0x17,    // methods: tag
+    0x08,    // methods: flags (AccessPublic, MethodSlot)
+
+    0x3C,    // methods: name (reset)
+    0x42,    // methods: signature
+    0x17,    // methods: tag
+    0x28,    // methods: flags (AccessPublic, MethodSlot, MethodCompatibility)
+
+    0x48,    // properties: name
+    0x4E,    // properties: type
+    0x00,    // properties: flags (Readable, Writable)
+
+    0x00     // eod
+};
+
+// ========== 2. 字符串表 ==========
+static const char qt_meta_stringdata_MyClass[] = {
+    "MyClass\0valueChanged\0valueChanged(int)\0int\0"
+    "\0onDataChanged\0onDataChanged(QString)\0QString\0"
+    "\0reset\0reset()\0\0value\0int\0"
+};
+
+// ========== 3. QMetaObject 实例 ==========
+const QMetaObject MyClass::staticMetaObject = {
+    { &QObject::staticMetaObject,     // superdata (父类)
+      qt_meta_stringdata_MyClass,     // stringdata
+      qt_meta_data_MyClass,          // data
+      qt_static_metacall,            // 静态元调用函数指针
+      nullptr,
+      nullptr
+    }
+};
+
+// ========== 4. 获取元对象（虚函数实现）==========
+const QMetaObject *MyClass::metaObject() const
+{
+    return &staticMetaObject;
+}
+
+// ========== 5. 元调用分发器（核心）==========
+int MyClass::qt_metacall(QMetaObject::Call _c, int _id, void **_a)
+{
+    // ========== 先调用父类的元调用 ==========
+    _id = QObject::qt_metacall(_c, _id, _a);
+    if (_id < 0)
+        return _id;  // 父类已处理，直接返回
+
+    // ========== 处理本类的方法 ==========
+    // 根据调用类型分发
+    switch (_c) {
+        case QMetaObject::InvokeMetaMethod:
+            // 方法调用
+            switch (_id) {
+                case 0: // valueChanged(int)
+                    valueChanged((*reinterpret_cast<int(*)>(_a[1])));
+                    break;
+                case 1: // onDataChanged(QString)
+                    onDataChanged((*reinterpret_cast<QString(*)>(_a[1])));
+                    break;
+                case 2: // reset()
+                    reset();
+                    break;
+                default: ;
+            }
+            break;
+
+        case QMetaObject::ReadProperty:
+        case QMetaObject::WriteProperty:
+            // 属性读写
+            switch (_id) {
+                case 0: // value 属性
+                    if (_c == QMetaObject::ReadProperty)
+                        *_a[0] = QVariant::fromValue(this->value());
+                    else
+                        this->setValue((*reinterpret_cast<int(*)>(_a[1])));
+                    break;
+                default: ;
+            }
+            break;
+
+        case QMetaObject::ResetProperty:
+            // 属性重置
+            if (_id == 0)
+                this->setValue(0);  // 重置为默认值
+            break;
+
+        default: ;
+    }
+
+    // 返回未处理的偏移量
+    _id -= 3;  // 本类有 3 个方法
+    return _id;
+}
+
+// ========== 6. 类型转换（RTTI 替代）==========
+void *MyClass::qt_metacast(const char *_clname)
+{
+    if (!_clname) return nullptr;
+    if (!strcmp(_clname, qt_meta_stringdata_MyClass))
+        return static_cast<void*>(this);
+    return QObject::qt_metacast(_clname);  // 查父类
+}
+
+// ========== 7. 静态元调用（用于信号激活等）==========
+void MyClass::qt_static_metacall(QObject *_o, QMetaObject::Call _c,
+                                  int _id, void **_a)
+{
+    if (_c == QMetaObject::InvokeMetaMethod) {
+        MyClass *_t = static_cast<MyClass *>(_o);
+        switch (_id) {
+            case 0: _t->valueChanged((*reinterpret_cast<int(*)>(_a[1]))); break;
+            case 1: _t->onDataChanged((*reinterpret_cast<QString(*)>(_a[1]))); break;
+            case 2: _t->reset(); break;
+            default: ;
+        }
+    } else if (_c == QMetaObject::RegisterMethodArgumentMetaType) {
+        // 注册参数类型
+        switch (_id) {
+            case 0:
+                *reinterpret_cast<int*>(_a[0]) = qRegisterMetaType<int>();
+                break;
+            case 1:
+                *reinterpret_cast<int*>(_a[0]) = qRegisterMetaType<QString>();
+                break;
+            default: ;
+        }
+    }
+}
+
+// ========== 8. 信号实现（由 MOC 生成）==========
+// SIGNAL 0: valueChanged(int)
+void MyClass::valueChanged(int _t1)
+{
+    void *_a[] = { nullptr, const_cast<void*>(reinterpret_cast<const void*>(&_t1)) };
+    QMetaObject::activate(this, &staticMetaObject, 0, _a);
+}
+
+// ========== 元对象私有数据 ==========
+const QMetaObjectPrivate MyClass::staticMetaObjectPrivate = {
+    // ... 版本、标志等
+};
+```
+
+**qt_metacall 调用流程详解**
+
+```cpp
+// ========== qt_metacall 是反射的核心 ==========
+
+/*
+ * 调用链路：
+ * QMetaObject::invokeMethod()
+ *     ↓
+ * QMetaObject::metacall()  // 静态方法
+ *     ↓
+ * QObject::qt_metacall()  // 虚函数
+ *     ↓
+ * MyClass::qt_metacall()  // 子类重写
+ *     ↓
+ * switch (_id) -> 实际方法调用
+ */
+
+// ========== invokeMethod 使用示例 ==========
+QMetaObject::invokeMethod(obj, "reset");
+// 等价于 obj->reset();
+
+// ========== 带参数的调用 ==========
+QMetaObject::invokeMethod(obj, "setValue",
+                         Q_ARG(int, 42));
+
+// ========== 异步调用（跨线程）==========
+QMetaObject::invokeMethod(obj, "reset",
+                         Qt::QueuedConnection);
+
+// ========== invokeMethod 内部实现（简化）==========
+bool QMetaObject::invokeMethod(
+    QObject *obj,
+    const char *member,
+    Qt::ConnectionType type,
+    QGenericReturnArgument ret,
+    QGenericArgument val0,
+    QGenericArgument val1,
+    QGenericArgument val2,
+    QGenericArgument val3,
+    QGenericArgument val4,
+    QGenericArgument val5,
+    QGenericArgument val6,
+    QGenericArgument val7,
+    QGenericArgument val8,
+    QGenericArgument val9)
+{
+    // 1. 查找方法索引
+    int idx = obj->metaObject()->indexOfMethod(member);
+    if (idx < 0) return false;
+
+    // 2. 准备参数数组
+    void *_a[11];
+    _a[0] = ret.data();  // 返回值位置
+    _a[1] = val0.data();
+    _a[2] = val1.data();
+    // ... _a[10]
+
+    // 3. 根据连接类型分发
+    if (type == Qt::DirectConnection) {
+        // 同步调用
+        return QMetaObject::metacall(obj, InvokeMetaMethod, idx, _a) >= 0;
+    } else {
+        // 异步调用（创建 QMetaCallEvent）
+        return QMetaObject::invokeMethod(obj, member, type, ret,
+                                         val0, val1, val2, val3, val4,
+                                         val5, val6, val7, val8, val9);
+    }
+}
+```
+
+**QMetaObjectPrivate 结构（内部元数据）**
+
+```cpp
+// qmetaobject_p.h
+struct QMetaObjectPrivate {
+    int revision;              // 版本号
+    int className;             // 类名索引
+    int classInfoCount;        // 类信息数量
+    int classInfoOffset;       // 类信息偏移
+    int methodCount;           // 方法数量
+    int methodOffset;          // 方法偏移
+    int propertyCount;         // 属性数量
+    int propertyOffset;        // 属性偏移
+    int enumeratorCount;       // 枚举数量
+    int enumeratorOffset;      // 枚举偏移
+    int constructorCount;      // 构造函数数量
+    int constructorOffset;     // 构造函数偏移
+    int flags;                 // 标志位
+
+    // 计算属性
+    int signalCount() const {
+        // 从 methodOffset 开始，找到第一个非 signal 的方法
+        int count = 0;
+        for (int i = methodOffset; i < methodOffset + methodCount; ++i) {
+            if (data[i * 5 + 4] & 0x10)  // MethodSignal 标志
+                ++count;
+            else
+                break;
+        }
+        return count;
+    }
+};
 ```
 
 ### 2.3 事件循环与事件处理
@@ -532,6 +1228,349 @@ protected:
  * QEvent::Show                  - 显示事件
  * QEvent::Hide                  - 隐藏事件
  */
+```
+
+---
+
+#### 事件循环底层实现
+
+**QEventLoop::exec 核心实现**
+
+```cpp
+// qeventloop.cpp - 事件循环核心实现
+int QEventLoop::exec(ProcessEventsFlags flags)
+{
+    // ========== 1. 初始化 ==========
+    Q_D(QEventLoop);
+    d->threadData->eventLoop = this;  // 记录当前事件循环
+    d->exit = false;                   // 退出标志
+    d->returnCode = 0;
+
+    // ========== 2. 进入循环 ==========
+    while (!d->exit) {
+        // ========== 3. 处理事件队列中的事件 ==========
+        processEvents(flags |
+                      WaitForMoreEvents |  // 没有事件时等待
+                      EventLoopExec);      // 标记为 exec 模式
+
+        // ========== 4. 处理投递的事件 ==========
+        // sendEvent 发送的事件存储在 postedEvents 链表中
+        QCoreApplication::sendPostedEvents();
+
+        // ========== 5. 空闲处理 ==========
+        // 如果队列中没有事件，执行空闲任务
+        if (d->eventQueue.isEmpty()) {
+            QCoreApplication::processEvents(QEventLoop::ProcessEventsFlag::DeferredDeletion);
+        }
+    }
+
+    // ========== 6. 清理并退出 ==========
+    d->threadData->eventLoop = nullptr;
+    return d->returnCode;
+}
+```
+
+**processEvents 实现（处理系统事件）**
+
+```cpp
+// qeventloop.cpp
+bool QEventLoop::processEvents(ProcessEventsFlags flags)
+{
+    Q_D(QEventLoop);
+
+    // ========== 1. 处理 Qt 事件队列 ==========
+    while (!d->eventQueue.isEmpty()) {
+        // 从队列取出事件
+        QEvent* e = d->eventQueue.takeFirst();
+
+        // 分发事件
+        if (!QCoreApplication::sendEvent(d->eventReceiver, e)) {
+            // 事件未被处理，删除事件
+            delete e;
+        }
+    }
+
+    // ========== 2. 处理系统事件（Windows、X11、macOS）==========
+    if (flags & WaitForMoreEvents) {
+        // 没有事件时，等待系统事件
+        // Windows: GetMessage/PeekMessage
+        // X11: XNextEvent
+        // macOS: NSRunLoop
+        return processSystemEvents(flags);
+    }
+
+    return true;
+}
+
+// ========== Windows 平台实现 ==========
+#ifdef Q_OS_WIN
+bool QEventLoop::processSystemEvents(ProcessEventsFlags flags)
+{
+    // MSG 结构体
+    MSG msg;
+
+    // PeekMessage 检查消息队列
+    if (flags & WaitForMoreEvents) {
+        // 等待模式：GetMessage（阻塞）
+        if (GetMessage(&msg, NULL, 0, 0)) {
+            // 转换虚拟键码
+            TranslateMessage(&msg);
+
+            // 分发到窗口过程
+            DispatchMessage(&msg);
+        }
+    } else {
+        // 非等待模式：PeekMessage（非阻塞）
+        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+    }
+
+    return true;
+}
+#endif
+```
+
+**QApplication::notify 事件分发链路**
+
+```cpp
+// qapplication.cpp - 事件分发入口
+bool QApplication::notify(QObject *receiver, QEvent *event)
+{
+    // ========== 1. 应用级事件过滤 ==========
+    if (QApplicationPrivate::eventFilter) {
+        if (QApplicationPrivate::eventFilter->eventFilter(receiver, event))
+            return true;  // 被过滤器拦截
+    }
+
+    // ========== 2. 事件压缩（用于连续事件）==========
+    if (event->type() == QEvent::UpdateRequest ||
+        event->type() == QEvent::LayoutRequest) {
+        // 多个相同事件可以合并为一个
+        if (compressEvent(event))
+            return true;
+    }
+
+    // ========== 3. 特殊事件处理 ==========
+    switch (event->type()) {
+        case QEvent::ApplicationActivate:
+            handleApplicationActivateEvent(event);
+            return true;
+
+        case QEvent::FileOpen:
+            handleFileOpenEvent(static_cast<QFileOpenEvent*>(event));
+            return true;
+    }
+
+    // ========== 4. 递归事件检测 ==========
+    // 防止事件处理中再次处理相同事件导致无限递归
+    if (receiver->d_func()->isDeletingChildren) {
+        // 对象正在删除子对象，跳过事件
+        return true;
+    }
+
+    // ========== 5. 调用对象的 event() 方法 ==========
+    bool result = receiver->event(event);
+
+    // ========== 6. 事件后处理 ==========
+    if (!result && event->type() == QEvent::DeferredDelete) {
+        // 延迟删除事件：未被处理时自动删除对象
+        delete receiver;
+        result = true;
+    }
+
+    return result;
+}
+```
+
+**sendEvent vs postEvent 区别**
+
+```cpp
+// qcoreapplication.cpp
+
+// ========== sendEvent：同步事件 ==========
+bool QCoreApplication::sendEvent(QObject *receiver, QEvent *event)
+{
+    if (!receiver || !event)
+        return false;
+
+    // 直接调用 receiver->event()
+    // 在同一线程，立即执行
+    QEventLoop *eventLoop = QThread::currentEventLoop();
+
+    // 处理递归检测
+    if (eventLoop) {
+        eventLoop->d_func()->execRecursion++;
+    }
+
+    // ========== 同步调用 ==========
+    bool result = receiver->event(event);
+
+    // 清理事件
+    if (event->spontaneous()) {
+        // 自发事件（系统产生）需要手动删除
+        delete event;
+    } else if (!result && event->type() == QEvent::DeferredDelete) {
+        // DeferredDelete 未被处理时删除对象
+        delete receiver;
+    }
+
+    return result;
+}
+
+// ========== postEvent：异步事件 ==========
+void QCoreApplication::postEvent(QObject *receiver, QEvent *event, int priority)
+{
+    if (!receiver || !event)
+        return;
+
+    // ========== 添加到事件队列 ==========
+    QThreadData *data = QThreadData::get(receiver->thread());
+
+    // 清除旧事件（DeferredDelete 类型）
+    if (event->type() == QEvent::DeferredDelete) {
+        data->postEventList.removeAll(event);
+    }
+
+    // ========== 按优先级插入 ==========
+    QPostEventList &list = data->postEventList;
+    int i = 0;
+
+    if (priority == Qt::HighEventPriority) {
+        // 高优先级：插入到头部
+        i = 0;
+    } else if (priority == Qt::LowEventPriority) {
+        // 低优先级：插入到尾部
+        i = list.size();
+    } else {
+        // 正常优先级：在 DeferredDelete 之前
+        for (; i < list.size(); ++i) {
+            const QPostEvent &pe = list.at(i);
+            if (pe.event->type() == QEvent::DeferredDelete &&
+                !pe.event->spontaneous())
+                break;
+        }
+    }
+
+    // 插入事件
+    list.insert(i, QPostEvent(receiver, event));
+
+    // ========== 唤醒事件循环 ==========
+    // 如果接收者在其他线程，需要唤醒该线程的事件循环
+    if (receiver->thread() != QThread::currentThread()) {
+        // 跨线程：唤醒接收者线程
+        QAbstractEventDispatcher *dispatcher =
+            data->eventDispatcher;
+        if (dispatcher)
+            dispatcher->wakeUp();
+    }
+}
+
+// ========== sendPostedEvents：处理投递的事件 ==========
+void QCoreApplication::sendPostedEvents()
+{
+    QThreadData *data = QThreadData::current();
+
+    // ========== 处理事件队列 ==========
+    QPostEventList &list = data->postEventList;
+
+    while (!list.isEmpty()) {
+        // 取出事件
+        QPostEvent pe = list.takeFirst();
+
+        // 检查接收者是否还存活
+        if (!pe.receiver) {
+            delete pe.event;
+            continue;
+        }
+
+        // 调用 sendEvent 处理
+        sendEvent(pe.receiver, pe.event);
+    }
+}
+```
+
+**事件队列数据结构**
+
+```cpp
+// qcoreapplication_p.h
+
+// ========== 投递事件结构 ==========
+struct QPostEvent {
+    QObject *receiver;        // 接收者
+    QEvent *event;            // 事件
+    int priority;            // 优先级
+
+    QPostEvent(QObject *r, QEvent *e, int p = NormalEventPriority)
+        : receiver(r), event(e), priority(p) {}
+};
+
+// ========== 投递事件列表 ==========
+class QPostEventList : public QList<QPostEvent> {
+public:
+    // 优化：移除所有指向已删除对象的事件
+    void removeAll(QObject *obj) {
+        for (int i = size() - 1; i >= 0; --i) {
+            if (at(i).receiver == obj) {
+                delete at(i).event;
+                removeAt(i);
+            }
+        }
+    }
+};
+
+// ========== 线程数据 ==========
+class QThreadData {
+public:
+    QPostEventList postEventList;     // 投递事件队列
+    QEventLoop *eventLoop;            // 当前事件循环
+    QAbstractEventDispatcher *eventDispatcher;  // 事件分发器
+
+    // ... 其他数据
+};
+```
+
+**事件完整生命周期**
+
+```
+系统产生事件（鼠标点击）
+    |
+    v
+Windows/X11/macOS 消息队列
+    |
+    v
+QAbstractEventDispatcher::processEvents()
+    |
+    v
+转换为 QEvent (QMouseEvent)
+    |
+    v
+QCoreApplication::postEvent()  (异步)
+    |
+    v
+QPostEventList (事件队列)
+    |
+    v
+QEventLoop::exec() 检测到新事件
+    |
+    v
+sendPostedEvents() 处理投递事件
+    |
+    v
+QApplication::notify() 分发
+    |
+    v
+事件过滤器链 eventFilter()
+    |
+    v
+QObject::event() 入口
+    |
+    v
+具体事件处理器 (mousePressEvent)
+    |
+    v
+事件处理完成，delete event
 ```
 
 ---
