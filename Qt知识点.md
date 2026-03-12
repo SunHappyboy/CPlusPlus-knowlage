@@ -1575,6 +1575,472 @@ QObject::event() 入口
 
 ---
 
+#### Windows 平台事件处理详解
+
+**Windows 消息循环 vs Qt 事件循环**
+
+```cpp
+// ========== Windows 原生消息循环 ==========
+
+// 1. Windows 消息结构（MSG）
+typedef struct tagMSG {
+    HWND   hwnd;      // 消息目标窗口
+    UINT   message;   // 消息类型（WM_*）
+    WPARAM wParam;    // 附加参数1
+    LPARAM lParam;    // 附加参数2
+    DWORD  time;      // 消息时间
+    POINT  pt;        // 鼠标位置
+} MSG;
+
+// 2. Windows 消息循环（WinMain 入口）
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
+                    LPSTR lpCmdLine, int nCmdShow)
+{
+    HWND hWnd = CreateWindow(...);
+    ShowWindow(hWnd, nCmdShow);
+    UpdateWindow(hWnd);
+
+    // ========== 消息循环 ==========
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {  // 从消息队列获取消息
+        TranslateMessage(&msg);              // 翻译键盘消息
+        DispatchMessage(&msg);               // 分发到窗口过程
+    }
+
+    return msg.wParam;
+}
+
+// 3. 窗口过程（WndProc）
+LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message) {
+        case WM_LBUTTONDOWN:         // 鼠标左键按下
+            // 处理鼠标点击
+            return 0;
+        case WM_KEYDOWN:             // 键盘按下
+            // 处理按键
+            return 0;
+        case WM_PAINT:               // 绘图
+            // 处理绘图
+            return 0;
+        case WM_DESTROY:             // 窗口销毁
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProc(hwnd, message, wParam, lParam);
+}
+
+// ========== Qt 事件循环（对比）==========
+
+int main(int argc, char *argv[])
+{
+    QApplication app(argc, argv);
+
+    MyWidget window;
+    window.show();
+
+    // ========== Qt 事件循环 ==========
+    return app.exec();  // 内部调用 QEventLoop::exec()
+}
+
+// Qt 内部实现（Windows 平台）
+bool QEventDispatcherWindows::processEvents(QEventLoop::ProcessEventsFlags flags)
+{
+    // 处理 Qt 事件队列
+    sendPostedEvents();
+
+    // 处理 Windows 消息
+    MSG msg;
+    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) {
+            // 收到退出消息
+            return false;
+        }
+
+        TranslateMessage(&msg);
+        // Qt 拦截 DispatchMessage，使用自己的钩子
+        DispatchMessage(&msg);
+    }
+
+    return true;
+}
+```
+
+**Qt 在 Windows 平台的架构**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Qt 应用层                                │
+│                  (QWidget, QObject 等)                       │
+├─────────────────────────────────────────────────────────────┤
+│                  Qt 事件抽象层                              │
+│           (QEvent, QMouseEvent, QKeyEvent 等)                │
+├─────────────────────────────────────────────────────────────┤
+│              QEventDispatcherWindows                         │
+│        (转换 Windows 消息为 Qt 事件)                         │
+├─────────────────────────────────────────────────────────────┤
+│                    Windows API                              │
+│          (GetMessage, DispatchMessage, WndProc)             │
+├─────────────────────────────────────────────────────────────┤
+│                     操作系统                                  │
+│                      (Windows)                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Qt 如何处理 Windows 消息**
+
+```cpp
+// ========== Qt 窗口注册（Windows 平台）==========
+
+// qwindowscontext.cpp
+HWND QWindowsContext::createHWND(QWidget *widget, const QWindowsWindowData &data)
+{
+    // 创建 Windows 窗口
+    HWND hwnd = CreateWindowEx(
+        data.exStyle,           // 扩展样式
+        data.windowClass,       // 窗口类
+        data.title,             // 标题
+        data.style,             // 窗口样式
+        data.geometry.x,        // 位置
+        data.geometry.y,
+        data.geometry.width,
+        data.geometry.height,
+        data.parent,            // 父窗口
+        data.menu,              // 菜单
+        data.instance,          // 实例
+        data.createParam        // 创建参数
+    );
+
+    return hwnd;
+}
+
+// ========== Qt 窗口过程（WndProc 钩子）==========
+
+// qwindowswindow.cpp
+LRESULT CALLBACK QWindowsWindowWndProc(HWND hwnd, UINT message,
+                                       WPARAM wParam, LPARAM lParam)
+{
+    // Qt 的全局窗口过程
+    QWindowsWindow *platformWindow = ...
+
+    // 转换 Windows 消息为 Qt 事件
+    switch (message) {
+        case WM_LBUTTONDOWN:
+            return platformWindow->handleMouseEvent(QEvent::MouseButtonPress, ...);
+
+        case WM_KEYDOWN:
+            return platformWindow->handleKeyEvent(QEvent::KeyPress, ...);
+
+        case WM_PAINT:
+            return platformWindow->handlePaintEvent(...);
+
+        // 默认处理
+        default:
+            return DefWindowProc(hwnd, message, wParam, lParam);
+    }
+}
+
+// ========== nativeEvent：处理 Windows 消息 ==========
+
+class MyWidget : public QWidget {
+protected:
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override#else
+    bool nativeEvent(const QByteArray& eventType, void* message, long* result) override#endif
+    {
+        if (eventType == "windows_generic_MSG") {
+            MSG* msg = static_cast<MSG*>(message);
+
+            switch (msg->message) {
+                case WM_POWERBROADCAST:
+                    // 系统电源事件
+                    if (msg->wParam == PBT_APMSUSPEND) {
+                        qDebug() << "System suspending";
+                        saveData();
+                        *result = TRUE;
+                        return true;
+                    }
+                    break;
+
+                case WM_DEVICECHANGE:
+                    // 设备变化事件
+                    qDebug() << "Device changed";
+                    break;
+
+                case WM_HOTKEY:
+                    // 全局热键
+                    qDebug() << "Hotkey pressed:" << msg->wParam;
+                    *result = 0;
+                    return true;
+
+                case WM_COPYDATA:
+                    // 进程间通信（WM_COPYDATA）
+                    COPYDATASTRUCT* cds = (COPYDATASTRUCT*)msg->lParam;
+                    QString data = QString::fromUtf8((char*)cds->lpData);
+                    qDebug() << "Received data:" << data;
+                    *result = TRUE;
+                    return true;
+            }
+        }
+
+        return QWidget::nativeEvent(eventType, message, result);
+    }
+};
+
+// ========== 注册全局热键（Windows API）==========
+
+class HotKeyWidget : public QWidget {
+public:
+    HotKeyWidget(QWidget* parent = nullptr) : QWidget(parent) {
+        // 注册 Ctrl+Shift+A 作为全局热键
+        int id = 1;
+        if (RegisterHotKey((HWND)winId(), id,
+                           MOD_CONTROL | MOD_SHIFT, 0x41)) {  // 0x41 = 'A'
+            qDebug() << "Hotkey registered";
+        }
+    }
+
+    ~HotKeyWidget() {
+        UnregisterHotKey((HWND)winId(), 1);
+    }
+
+protected:
+    bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override {
+        if (eventType == "windows_generic_MSG") {
+            MSG* msg = static_cast<MSG*>(message);
+            if (msg->message == WM_HOTKEY) {
+                qDebug() << "Global hotkey pressed!";
+                showWindow();
+                *result = 0;
+                return true;
+            }
+        }
+        return QWidget::nativeEvent(eventType, message, result);
+    }
+
+private:
+    void showWindow() {
+        showNormal();
+        raise();
+        activateWindow();
+    }
+};
+```
+
+**Qt 事件与 Windows 消息映射表**
+
+```cpp
+// ========== 鼠标事件映射 ==========
+
+/*
+ * Windows 消息              Qt 事件                    说明
+ * ───────────────────────────────────────────────────────
+ * WM_LBUTTONDOWN        → QEvent::MouseButtonPress    左键按下
+ * WM_LBUTTONUP          → QEvent::MouseButtonRelease  左键释放
+ * WM_LBUTTONDBLCLK      → QEvent::MouseButtonDblClick 左键双击
+ * WM_RBUTTONDOWN        → QEvent::MouseButtonPress    右键按下
+ * WM_RBUTTONUP          → QEvent::MouseButtonRelease  右键释放
+ * WM_RBUTTONDBLCLK      → QEvent::MouseButtonDblClick 右键双击
+ * WM_MBUTTONDOWN        → QEvent::MouseButtonPress    中键按下
+ * WM_MBUTTONUP          → QEvent::MouseButtonRelease  中键释放
+ * WM_MOUSEMOVE          → QEvent::MouseMove           鼠标移动
+ * WM_MOUSEWHEEL         → QEvent::Wheel               鼠标滚轮
+ * WM_MOUSEHOVER         → QEvent::HoverEnter          鼠标悬停进入
+ * WM_MOUSELEAVE         → QEvent::HoverLeave          鼠标悬停离开
+ */
+
+// ========== 键盘事件映射 ==========
+
+/*
+ * Windows 消息              Qt 事件                    说明
+ * ───────────────────────────────────────────────────────
+ * WM_KEYDOWN            → QEvent::KeyPress           键盘按下
+ * WM_KEYUP              → QEvent::KeyRelease         键盘释放
+ * WM_SYSKEYDOWN         → QEvent::KeyPress           系统键按下
+ * WM_SYSKEYUP           → QEvent::KeyRelease         系统键释放
+ * WM_CHAR               → QEvent::InputMethodEvent   字符输入
+ *
+ * 虚拟键码映射（部分）：
+ * VK_RETURN     → Qt::Key_Return
+ * VK_ESCAPE     → Qt::Key_Escape
+ * VK_SPACE      → Qt::Key_Space
+ * VK_TAB        → Qt::Key_Tab
+ * VK_BACK       → Qt::Key_Backspace
+ * VK_DELETE     → Qt::Key_Delete
+ * VK_HOME       → Qt::Key_Home
+ * VK_END        → Qt::Key_End
+ * VK_PRIOR      → Qt::Key_PageUp
+ * VK_NEXT       → Qt::Key_PageDown
+ * VK_LEFT       → Qt::Key_Left
+ * VK_RIGHT      → Qt::Key_Right
+ * VK_UP         → Qt::Key_Up
+ * VK_DOWN       → Qt::Key_Down
+ * VK_CONTROL    → Qt::Key_Control
+ * VK_SHIFT      → Qt::Key_Shift
+ * VK_MENU       → Qt::Key_Alt
+ */
+
+// ========== 窗口事件映射 ==========
+
+/*
+ * Windows 消息              Qt 事件                    说明
+ * ───────────────────────────────────────────────────────
+ * WM_CREATE             → QEvent::Create              窗口创建
+ * WM_SHOWWINDOW         → QEvent::Show / Hide         显示/隐藏
+ * WM_MOVE               → QEvent::Move                移动
+ * WM_SIZE               → QEvent::Resize              大小改变
+ * WM_PAINT              → QEvent::Paint               绘图
+ * WM_ERASEBKGND         → (内部处理)                 擦除背景
+ * WM_SETFOCUS           → QEvent::FocusIn             获得焦点
+ * WM_KILLFOCUS          → QEvent::FocusOut            失去焦点
+ * WM_ACTIVATE           → QEvent::ActivationChange    激活改变
+ * WM_ENABLE             → QEvent::EnabledChange       使能状态改变
+ * WM_CLOSE              → QEvent::Close               关闭
+ * WM_DESTROY            → QEvent::Destroy             销毁
+ * WM_QUERYENDSESSION    → QEvent::Close               系统关机
+ */
+
+// ========== 定时器事件映射 ==========
+
+/*
+ * Windows 消息              Qt 事件                    说明
+ * ───────────────────────────────────────────────────────
+ * WM_TIMER              → QEvent::Timer               定时器
+ *                         (QTimerEvent)
+ *
+ * Qt 在 Windows 上使用 SetTimer/KillTimer 或
+ * 时间队列池（Timer Queue）实现定时器
+ */
+
+// ========== 系统事件映射 ==========
+
+/*
+ * Windows 消息              Qt 事件                    说明
+ * ───────────────────────────────────────────────────────
+ * WM_COMMAND            → QAction 触发               菜单/工具栏
+ * WM_NOTIFY             → (内部处理)                 控件通知
+ * WM_HSCROLL            → QEvent::Wheel               水平滚动
+ * WM_VSCROLL            → QEvent::Wheel               垂直滚动
+ * WM_CTLCOLOR*          → (内部处理)                 控件颜色
+ * WM_DRAWITEM           → (内部处理)                 自绘控件
+ * WM_CONTEXTMENU        → QEvent::ContextMenu        右键菜单
+ * WM_DRAG*              → QEvent::*                   拖放事件
+ */
+
+// ========== Qt 处理 Windows 消息示例 ==========
+
+// qwindowsmousehandler.cpp
+bool QWindowsMouseHandler::translateMouseEvent(QEvent::Type type, HWND hwnd,
+                                                Qt::MouseButton button,
+                                                const MSG &msg)
+{
+    // 提取坐标
+    QPoint globalPos(GET_X_LPARAM(msg.lParam), GET_Y_LPARAM(msg.lParam));
+    QPoint pos = globalPos - widget->mapToGlobal(QPoint(0, 0));
+
+    // 提取按键状态
+    Qt::MouseButtons buttons = 0;
+    if (msg.wParam & MK_LBUTTON) buttons |= Qt::LeftButton;
+    if (msg.wParam & MK_RBUTTON) buttons |= Qt::RightButton;
+    if (msg.wParam & MK_CONTROL) modifiers |= Qt::ControlModifier;
+    if (msg.wParam & MK_SHIFT)   modifiers |= Qt::ShiftModifier;
+
+    // 创建 Qt 鼠标事件
+    QMouseEvent *qe = new QMouseEvent(type, pos, globalPos,
+                                       button, buttons, modifiers);
+
+    // 发送到 Qt 事件队列
+    QCoreApplication::postEvent(widget, qe);
+
+    return true;
+}
+```
+
+**Windows 特定事件处理示例**
+
+```cpp
+// ========== 监听系统关机事件 ==========
+
+class ShutdownHandler : public QObject {
+    Q_OBJECT
+public:
+    ShutdownHandler(QObject* parent = nullptr) : QObject(parent) {}
+
+protected:
+    bool eventFilter(QObject* obj, QEvent* event) override {
+        // Qt 提供的跨平台方式
+        if (event->type() == QEvent::Close) {
+            QCloseEvent* closeEvent = static_cast<QCloseEvent*>(event);
+            // 检查是否是系统关机
+            if (isSystemShutdown()) {
+                qDebug() << "System is shutting down";
+                // 保存数据
+                saveCriticalData();
+            }
+        }
+        return QObject::eventFilter(obj, event);
+    }
+
+private:
+    bool isSystemShutdown() {
+        // 检查会话是否正在关闭
+        return GetSessionMetrics(0) == 0;
+    }
+
+    void saveCriticalData() {
+        // 保存关键数据
+    }
+};
+
+// ========== Windows 平台特定实现 ==========
+
+#ifdef Q_OS_WIN
+class WindowsPlatformWidget : public QWidget {
+public:
+    // ========== 设置窗口透明度（Windows API）==========
+    void setWindowOpacity qreal opacity) {
+        // Windows 2000+
+        HWND hwnd = (HWND)winId();
+        LONG_PTR style = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtr(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED);
+        SetLayeredWindowAttributes(hwnd, 0, int(opacity * 255), LWA_ALPHA);
+    }
+
+    // ========== 设置窗口层级（TopMost）==========
+    void setAlwaysOnTop(bool on) {
+        HWND hwnd = (HWND)winId();
+        SetWindowPos(hwnd, on ? HWND_TOPMOST : HWND_NOTOPMOST,
+                    0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    }
+
+    // ========== 闪动窗口（任务栏）==========
+    void flashWindow() {
+        HWND hwnd = (HWND)winId();
+        FLASHWINFO fi;
+        fi.cbSize = sizeof(FLASHWINFO);
+        fi.hwnd = hwnd;
+        fi.dwFlags = FLASHW_ALL | FLASHW_TIMERNOFG;
+        fi.uCount = 5;
+        fi.dwTimeout = 0;
+        FlashWindowEx(&fi);
+    }
+
+    // ========== 获取窗口矩形 ==========
+
+    QRect getWindowRect() const {
+        HWND hwnd = (HWND)winId();
+        RECT rect;
+        GetWindowRect(hwnd, &rect);
+        return QRect(rect.left, rect.top,
+                     rect.right - rect.left,
+                     rect.bottom - rect.top);
+    }
+};
+#endif
+```
+
+---
+
 ## 三、内存管理
 
 ### 3.1 对象树机制
