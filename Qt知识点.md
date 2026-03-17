@@ -8201,7 +8201,7 @@ connect(worker, &Worker::workFinished, this, [this](const QString& result) {
 class StoppableThread : public QThread {
 public:
     void stop() {
-        requestInterruption();  // 请求中断
+        requestInterruption();   // 请求中断
         quit();                  // 退出事件循环
         wait();                  // 等待线程结束
     }

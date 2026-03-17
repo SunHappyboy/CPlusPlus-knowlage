@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(powershell -Command \"\\(Get-Item ''面试知识点详细内容.md''\\).Length / 1KB\")",
-      "Bash(powershell -Command \"$content = Get-Content ''面试知识点详细内容.md'' -Head 3763; $content | Out-File -Encoding UTF8 ''面试知识点详细内容.md''\")"
+      "Bash(powershell -Command \"$content = Get-Content ''面试知识点详细内容.md'' -Head 3763; $content | Out-File -Encoding UTF8 ''面试知识点详细内容.md''\")",
+      "Bash(\"e:\\\\c++ test\\\\面试\\\\需要加强的知识点详解.md\":*)"
     ]
   }
 }
